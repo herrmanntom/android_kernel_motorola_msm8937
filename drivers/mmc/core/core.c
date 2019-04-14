@@ -3760,6 +3760,7 @@ EXPORT_SYMBOL(mmc_detect_card_removed);
 void mmc_rescan(struct work_struct *work)
 {
 	unsigned long flags;
+	int i;
 	struct mmc_host *host =
 		container_of(work, struct mmc_host, detect.work);
 
@@ -3820,7 +3821,12 @@ void mmc_rescan(struct work_struct *work)
 	}
 
 	mmc_claim_host(host);
-	(void) mmc_rescan_try_freq(host, host->f_min);
+	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
+		if (!mmc_rescan_try_freq(host, max(freqs[i], host->f_min)))
+			break;
+		if (freqs[i] <= host->f_min)
+			break;
+	}
 	mmc_release_host(host);
 
  out:
