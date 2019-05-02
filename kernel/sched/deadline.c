@@ -218,6 +218,52 @@ static inline void set_post_schedule(struct rq *rq)
 	rq->post_schedule = has_pushable_dl_tasks(rq);
 }
 
+static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq);
+
+static void dl_task_offline_migration(struct rq *rq, struct task_struct *p)
+{
+	struct rq *later_rq = NULL;
+	bool fallback = false;
+
+	later_rq = find_lock_later_rq(p, rq);
+
+	if (!later_rq) {
+		int cpu;
+
+		/*
+		 * If we cannot preempt any rq, fall back to pick any
+		 * online cpu.
+		 */
+		fallback = true;
+		cpu = cpumask_any_and(cpu_active_mask, tsk_cpus_allowed(p));
+		if (cpu >= nr_cpu_ids) {
+			/*
+			 * Fail to find any suitable cpu.
+			 * The task will never come back!
+			 */
+			BUG_ON(dl_bandwidth_enabled());
+
+			/*
+			 * If admission control is disabled we
+			 * try a little harder to let the task
+			 * run.
+			 */
+			cpu = cpumask_any(cpu_active_mask);
+		}
+		later_rq = cpu_rq(cpu);
+		double_lock_balance(rq, later_rq);
+	}
+
+	deactivate_task(rq, p, 0);
+	set_task_cpu(p, later_rq->cpu);
+	activate_task(later_rq, p, ENQUEUE_REPLENISH);
+
+	if (!fallback)
+		resched_curr(later_rq);
+
+	double_unlock_balance(rq, later_rq);
+}
+
 #else
 
 static inline
@@ -350,6 +396,11 @@ static void replenish_dl_entity(struct sched_dl_entity *dl_se,
 		dl_se->deadline = rq_clock(rq) + pi_se->dl_deadline;
 		dl_se->runtime = pi_se->dl_runtime;
 	}
+
+	if (dl_se->dl_yielded)
+		dl_se->dl_yielded = 0;
+	if (dl_se->dl_throttled)
+		dl_se->dl_throttled = 0;
 }
 
 /*
@@ -452,8 +503,6 @@ static int start_dl_timer(struct sched_dl_entity *dl_se, bool boosted)
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
 	struct rq *rq = rq_of_dl_rq(dl_rq);
 	ktime_t now, act;
-	ktime_t soft, hard;
-	unsigned long range;
 	s64 delta;
 
 	if (boosted)
@@ -476,15 +525,9 @@ static int start_dl_timer(struct sched_dl_entity *dl_se, bool boosted)
 	if (ktime_us_delta(act, now) < 0)
 		return 0;
 
-	hrtimer_set_expires(&dl_se->dl_timer, act);
+	hrtimer_start(&dl_se->dl_timer, act, HRTIMER_MODE_ABS);
 
-	soft = hrtimer_get_softexpires(&dl_se->dl_timer);
-	hard = hrtimer_get_expires(&dl_se->dl_timer);
-	range = ktime_to_ns(ktime_sub(hard, soft));
-	__hrtimer_start_range_ns(&dl_se->dl_timer, soft,
-				 range, HRTIMER_MODE_ABS, 0);
-
-	return hrtimer_active(&dl_se->dl_timer);
+	return 1;
 }
 
 /*
@@ -536,23 +579,50 @@ again:
 
 	sched_clock_tick();
 	update_rq_clock(rq);
-	dl_se->dl_throttled = 0;
-	dl_se->dl_yielded = 0;
-	if (task_on_rq_queued(p)) {
-		enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
-		if (dl_task(rq->curr))
-			check_preempt_curr_dl(rq, p, 0);
-		else
-			resched_curr(rq);
+
 #ifdef CONFIG_SMP
-		/*
-		 * Queueing this task back might have overloaded rq,
-		 * check if we need to kick someone away.
-		 */
-		if (has_pushable_dl_tasks(rq))
-			push_dl_task(rq);
-#endif
+	/*
+	 * If we find that the rq the task was on is no longer
+	 * available, we need to select a new rq.
+	 */
+	if (unlikely(!rq->online)) {
+		dl_task_offline_migration(rq, p);
+		goto unlock;
 	}
+#endif
+
+	/*
+	 * If the throttle happened during sched-out; like:
+	 *
+	 *   schedule()
+	 *     deactivate_task()
+	 *       dequeue_task_dl()
+	 *         update_curr_dl()
+	 *           start_dl_timer()
+	 *         __dequeue_task_dl()
+	 *     prev->on_rq = 0;
+	 *
+	 * We can be both throttled and !queued. Replenish the counter
+	 * but do not enqueue -- wait for our wakeup to do that.
+	 */
+	if (!task_on_rq_queued(p)) {
+		replenish_dl_entity(dl_se, dl_se);
+		goto unlock;
+	}
+
+	enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
+	if (dl_task(rq->curr))
+		check_preempt_curr_dl(rq, p, 0);
+	else
+		resched_curr(rq);
+#ifdef CONFIG_SMP
+	/*
+	 * Queueing this task back might have overloaded rq,
+	 * check if we need to kick someone away.
+	 */
+	if (has_pushable_dl_tasks(rq))
+		push_dl_task(rq);
+#endif
 unlock:
 	raw_spin_unlock(&rq->lock);
 
@@ -562,11 +632,6 @@ unlock:
 void init_dl_task_timer(struct sched_dl_entity *dl_se)
 {
 	struct hrtimer *timer = &dl_se->dl_timer;
-
-	if (hrtimer_active(timer)) {
-		hrtimer_try_to_cancel(timer);
-		return;
-	}
 
 	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	timer->function = dl_task_timer;
@@ -616,12 +681,11 @@ static void update_curr_dl(struct rq *rq)
 
 	sched_rt_avg_update(rq, delta_exec);
 
-	dl_se->runtime -= delta_exec;
+	dl_se->runtime -= dl_se->dl_yielded ? 0 : delta_exec;
 	if (dl_runtime_exceeded(rq, dl_se)) {
+		dl_se->dl_throttled = 1;
 		__dequeue_task_dl(rq, curr, 0);
-		if (likely(start_dl_timer(dl_se, curr->dl.dl_boosted)))
-			dl_se->dl_throttled = 1;
-		else
+		if (unlikely(!start_dl_timer(dl_se, curr->dl.dl_boosted)))
 			enqueue_task_dl(rq, curr, ENQUEUE_REPLENISH);
 
 		if (!is_leftmost(curr, &rq->dl))
@@ -904,7 +968,7 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 	 * its rq, the bandwidth timer callback (which clearly has not
 	 * run yet) will take care of this.
 	 */
-	if (p->dl.dl_throttled)
+	if (p->dl.dl_throttled && !(flags & ENQUEUE_REPLENISH))
 		return;
 
 	enqueue_dl_entity(&p->dl, pi_se, flags);
@@ -1145,6 +1209,7 @@ static void task_dead_dl(struct task_struct *p)
 	 * Since we are TASK_DEAD we won't slip out of the domain!
 	 */
 	raw_spin_lock_irq(&dl_b->lock);
+	/* XXX we should retain the bw until 0-lag */
 	dl_b->total_bw -= p->dl.dl_bw;
 	raw_spin_unlock_irq(&dl_b->lock);
 
@@ -1619,22 +1684,48 @@ void init_sched_dl_class(void)
 
 #endif /* CONFIG_SMP */
 
+/*
+ *  Ensure p's dl_timer is cancelled. May drop rq->lock for a while.
+ */
+static void cancel_dl_timer(struct rq *rq, struct task_struct *p)
+{
+	struct hrtimer *dl_timer = &p->dl.dl_timer;
+
+	/* Nobody will change task's class if pi_lock is held */
+	lockdep_assert_held(&p->pi_lock);
+
+	if (hrtimer_active(dl_timer)) {
+		int ret = hrtimer_try_to_cancel(dl_timer);
+
+		if (unlikely(ret == -1)) {
+			/*
+			 * Note, p may migrate OR new deadline tasks
+			 * may appear in rq when we are unlocking it.
+			 * A caller of us must be fine with that.
+			 */
+			raw_spin_unlock(&rq->lock);
+			hrtimer_cancel(dl_timer);
+			raw_spin_lock(&rq->lock);
+		}
+	}
+}
+
 static void switched_from_dl(struct rq *rq, struct task_struct *p)
 {
-	if (hrtimer_active(&p->dl.dl_timer) && !dl_policy(p->policy))
-		hrtimer_try_to_cancel(&p->dl.dl_timer);
-
+	/* XXX we should retain the bw until 0-lag */
+	cancel_dl_timer(rq, p);
 	__dl_clear_params(p);
 
-#ifdef CONFIG_SMP
 	/*
 	 * Since this might be the only -deadline task on the rq,
 	 * this is the right place to try to pull some other one
 	 * from an overloaded cpu, if any.
 	 */
-	if (!rq->dl.dl_nr_running)
-		pull_dl_task(rq);
-#endif
+	if (!task_on_rq_queued(p) || rq->dl.dl_nr_running)
+		return;
+
+	if (pull_dl_task(rq))
+		resched_curr(rq);
 }
 
 /*
