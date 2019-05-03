@@ -40,8 +40,14 @@ struct freq_max_load {
 
 extern DEFINE_PER_CPU(struct freq_max_load *, freq_max_load);
 
+extern void calc_global_load_tick(struct rq *this_rq);
 extern long calc_load_fold_active(struct rq *this_rq);
+
+#ifdef CONFIG_SMP
 extern void update_cpu_load_active(struct rq *this_rq);
+#else
+static inline void update_cpu_load_active(struct rq *this_rq) { }
+#endif
 
 /*
  * Helpers for converting nanosecond timing to jiffy resolution
@@ -802,7 +808,7 @@ DECLARE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
 
 static inline u64 __rq_clock_broken(struct rq *rq)
 {
-	return ACCESS_ONCE(rq->clock);
+	return READ_ONCE(rq->clock);
 }
 
 static inline u64 rq_clock(struct rq *rq)
@@ -1839,8 +1845,6 @@ extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime
 extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
 
 unsigned long to_ratio(u64 period, u64 runtime);
-
-extern void update_idle_cpu_load(struct rq *this_rq);
 
 extern void init_task_runnable_average(struct task_struct *p);
 
