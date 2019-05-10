@@ -5490,10 +5490,6 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.prev_sum_exec_runtime	= 0;
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;
-#ifdef CONFIG_SMP
-	p->se.avg.decay_count		= 0;
-#endif
-
 	INIT_LIST_HEAD(&p->se.group_node);
 
 #ifdef CONFIG_SCHEDSTATS
@@ -5801,7 +5797,7 @@ void wake_up_new_task(struct task_struct *p)
 #endif
 
 	/* Initialize new task's runnable average */
-	init_task_runnable_average(p);
+	init_entity_runnable_average(&p->se);
 	rq = __task_rq_lock(p);
 	mark_task_starting(p);
 	activate_task(rq, p, 0);
